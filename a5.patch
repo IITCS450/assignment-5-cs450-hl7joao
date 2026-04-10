@@ -1,0 +1,414 @@
+From 071409829386cd84f2cb9f9a71dcd7f06bebeaa1 Mon Sep 17 00:00:00 2001
+From: Edwin Huallpa <hl7joao@gmail.com>
+Date: Fri, 10 Apr 2026 18:44:20 -0500
+Subject: [PATCH] A5: user-level threads and mutexes
+
+---
+ Makefile  |   3 +-
+ test_pc.c |  89 +++++++++++++++++++++++++++
+ umutex.c  |  23 +++++++
+ umutex.h  |   9 +++
+ uswtch.S  |  21 +++++++
+ uthread.c | 180 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ uthread.h |  11 ++++
+ 7 files changed, 335 insertions(+), 1 deletion(-)
+ create mode 100644 test_pc.c
+ create mode 100644 umutex.c
+ create mode 100644 umutex.h
+ create mode 100644 uswtch.S
+ create mode 100644 uthread.c
+ create mode 100644 uthread.h
+
+diff --git a/Makefile b/Makefile
+index 09d790c..e1babfa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -143,7 +143,7 @@ tags: $(OBJS) entryother.S _init
+ vectors.S: vectors.pl
+ 	./vectors.pl > vectors.S
+ 
+-ULIB = ulib.o usys.o printf.o umalloc.o
++ULIB = ulib.o usys.o printf.o umalloc.o uthread.o umutex.o uswtch.o
+ 
+ _%: %.o $(ULIB)
+ 	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $@ $^
+@@ -181,6 +181,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_test_pc
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/test_pc.c b/test_pc.c
+new file mode 100644
+index 0000000..69b2069
+--- /dev/null
++++ b/test_pc.c
+@@ -0,0 +1,89 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "uthread.h"
++#include "umutex.h"
++
++#define NBUFSLOTS 8
++#define NITEMS    200
++
++static int buf[NBUFSLOTS];
++static int head = 0;
++static int tail = 0;
++static int count = 0;
++static umutex_t mu;
++
++static void
++producer(void *arg)
++{
++  int id = (int)arg;
++  int i;
++
++  for(i = 0; i < NITEMS; i++){
++    for(;;){
++      mutex_lock(&mu);
++      if(count < NBUFSLOTS){
++        buf[tail] = id * 100000 + i;
++        tail = (tail + 1) % NBUFSLOTS;
++        count++;
++        mutex_unlock(&mu);
++        break;
++      }
++      mutex_unlock(&mu);
++      thread_yield();
++    }
++  }
++}
++
++static void
++consumer(void *arg)
++{
++  int item;
++  int got;
++
++  (void)arg;
++  got = 0;
++
++  while(got < 2 * NITEMS){
++    for(;;){
++      mutex_lock(&mu);
++      if(count > 0){
++        item = buf[head];
++        head = (head + 1) % NBUFSLOTS;
++        count--;
++        mutex_unlock(&mu);
++        got++;
++        if((got % 100) == 0)
++          printf(1, "consumer got %d items (last=%d)\n", got, item);
++        break;
++      }
++      mutex_unlock(&mu);
++      thread_yield();
++    }
++  }
++}
++
++int
++main(void)
++{
++  tid_t p1, p2, c1;
++
++  thread_init();
++  mutex_init(&mu);
++
++  p1 = thread_create(producer, (void*)1);
++  p2 = thread_create(producer, (void*)2);
++  c1 = thread_create(consumer, 0);
++
++  if(p1 < 0 || p2 < 0 || c1 < 0){
++    printf(1, "thread_create failed\n");
++    exit();
++  }
++
++  thread_join(p1);
++  thread_join(p2);
++  thread_join(c1);
++
++  printf(1, "test_pc: done\n");
++  exit();
++}
+diff --git a/umutex.c b/umutex.c
+new file mode 100644
+index 0000000..5dec848
+--- /dev/null
++++ b/umutex.c
+@@ -0,0 +1,23 @@
++#include "types.h"
++#include "umutex.h"
++#include "uthread.h"
++
++void
++mutex_init(umutex_t *m)
++{
++  m->locked = 0;
++}
++
++void
++mutex_lock(umutex_t *m)
++{
++  while(m->locked)
++    thread_yield();
++  m->locked = 1;
++}
++
++void
++mutex_unlock(umutex_t *m)
++{
++  m->locked = 0;
++}
+diff --git a/umutex.h b/umutex.h
+new file mode 100644
+index 0000000..12a192e
+--- /dev/null
++++ b/umutex.h
+@@ -0,0 +1,9 @@
++#pragma once
++
++typedef struct {
++  int locked;
++} umutex_t;
++
++void mutex_init(umutex_t *m);
++void mutex_lock(umutex_t *m);
++void mutex_unlock(umutex_t *m);
+diff --git a/uswtch.S b/uswtch.S
+new file mode 100644
+index 0000000..11d7677
+--- /dev/null
++++ b/uswtch.S
+@@ -0,0 +1,21 @@
++# User-space context switch for xv6 x86
++# void uswtch(struct context **old, struct context *new);
++
++.globl uswtch
++uswtch:
++  movl 4(%esp), %eax
++  movl 8(%esp), %edx
++
++  pushl %ebp
++  pushl %ebx
++  pushl %esi
++  pushl %edi
++
++  movl %esp, (%eax)
++  movl %edx, %esp
++
++  popl %edi
++  popl %esi
++  popl %ebx
++  popl %ebp
++  ret
+diff --git a/uthread.c b/uthread.c
+new file mode 100644
+index 0000000..025ccd1
+--- /dev/null
++++ b/uthread.c
+@@ -0,0 +1,180 @@
++#include "types.h"
++#include "user.h"
++#include "uthread.h"
++
++#define MAXTHREADS 16
++#define STACKSIZE  4096
++
++enum tstate {
++  T_FREE,
++  T_RUNNABLE,
++  T_RUNNING,
++  T_ZOMBIE
++};
++
++struct context {
++  uint edi;
++  uint esi;
++  uint ebx;
++  uint ebp;
++  uint eip;
++};
++
++struct thread {
++  tid_t tid;
++  enum tstate state;
++  void *stack;
++  struct context *context;
++};
++
++static struct thread threads[MAXTHREADS];
++static struct thread *current;
++static int initialized = 0;
++static int nexttid = 1;
++
++static struct thread*
++pick_next(void)
++{
++  int start, i, idx;
++
++  if(current)
++    start = (current - threads + 1) % MAXTHREADS;
++  else
++    start = 0;
++
++  for(i = 0; i < MAXTHREADS; i++){
++    idx = (start + i) % MAXTHREADS;
++    if(threads[idx].state == T_RUNNABLE)
++      return &threads[idx];
++  }
++  return 0;
++}
++
++static void
++thread_stub(void (*fn)(void*), void *arg)
++{
++  fn(arg);
++  current->state = T_ZOMBIE;
++  thread_yield();
++  exit();
++}
++
++void
++thread_init(void)
++{
++  int i;
++
++  if(initialized)
++    return;
++
++  for(i = 0; i < MAXTHREADS; i++){
++    threads[i].tid = 0;
++    threads[i].state = T_FREE;
++    threads[i].stack = 0;
++    threads[i].context = 0;
++  }
++
++  threads[0].tid = nexttid++;
++  threads[0].state = T_RUNNING;
++  threads[0].stack = 0;
++  threads[0].context = 0;
++  current = &threads[0];
++
++  initialized = 1;
++}
++
++tid_t
++thread_create(void (*fn)(void*), void *arg)
++{
++  int i;
++  char *stack;
++  uint *sp;
++  struct thread *t;
++
++  if(!initialized)
++    thread_init();
++
++  for(i = 0; i < MAXTHREADS; i++){
++    if(threads[i].state == T_FREE)
++      break;
++  }
++  if(i == MAXTHREADS)
++    return -1;
++
++  t = &threads[i];
++  stack = malloc(STACKSIZE);
++  if(stack == 0)
++    return -1;
++
++  sp = (uint*)(stack + STACKSIZE);
++
++  *--sp = (uint)arg;
++  *--sp = (uint)fn;
++  *--sp = 0xffffffff;
++
++  *--sp = (uint)thread_stub;
++  *--sp = 0;
++  *--sp = 0;
++  *--sp = 0;
++  *--sp = 0;
++
++  t->tid = nexttid++;
++  t->state = T_RUNNABLE;
++  t->stack = stack;
++  t->context = (struct context*)sp;
++
++  return t->tid;
++}
++
++void
++thread_yield(void)
++{
++  struct thread *prev, *next;
++
++  if(!initialized)
++    thread_init();
++
++  prev = current;
++  next = pick_next();
++
++  if(next == 0)
++    return;
++
++  if(prev->state == T_RUNNING)
++    prev->state = T_RUNNABLE;
++
++  next->state = T_RUNNING;
++  current = next;
++
++  uswtch(&prev->context, next->context);
++}
++
++int
++thread_join(tid_t tid)
++{
++  int i;
++  struct thread *t;
++
++  for(;;){
++    for(i = 0; i < MAXTHREADS; i++){
++      t = &threads[i];
++      if(t->tid == tid){
++        if(t->state == T_ZOMBIE){
++          if(t->stack)
++            free(t->stack);
++          t->tid = 0;
++          t->state = T_FREE;
++          t->stack = 0;
++          t->context = 0;
++          return 0;
++        }
++        break;
++      }
++    }
++
++    if(i == MAXTHREADS)
++      return -1;
++
++    thread_yield();
++  }
++}
+diff --git a/uthread.h b/uthread.h
+new file mode 100644
+index 0000000..d54228d
+--- /dev/null
++++ b/uthread.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++typedef int tid_t;
++
++void  thread_init(void);
++tid_t thread_create(void (*fn)(void*), void *arg);
++void  thread_yield(void);
++int   thread_join(tid_t tid);
++
++struct context;
++void uswtch(struct context **old, struct context *new);
+-- 
+2.50.1 (Apple Git-155)
+
